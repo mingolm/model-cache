@@ -7,13 +7,18 @@ import (
 	"github.com/mingolm/model-cache/marshal"
 	"github.com/mingolm/model-cache/store"
 	"github.com/spf13/cast"
+	"golang.org/x/sync/errgroup"
 	"time"
 )
 
 type Cache[K comparable, V any] interface {
+	// Get 读取单条数据
 	Get(ctx context.Context, key K) (*V, error)
+	// MGet 批量读取
 	MGet(ctx context.Context, keys ...K) ([]V, error)
+	// Del 移除
 	Del(ctx context.Context, keys ...K) error
+	// Refresh 主动刷新
 	Refresh(ctx context.Context, keys ...K) (map[K]V, error)
 }
 
@@ -146,7 +151,7 @@ func (c *cache[K, V]) getCacheKey(key K) (cacheKey string) {
 		panic(fmt.Errorf("key to string failed: %w", err))
 	}
 
-	return keyStr
+	return c.KeyPrefix + keyStr
 }
 
 func (c *cache[K, V]) backSourceAndSetStore(ctx context.Context, keys ...K) (results map[K]V, err error) {
@@ -154,23 +159,32 @@ func (c *cache[K, V]) backSourceAndSetStore(ctx context.Context, keys ...K) (res
 	if err != nil {
 		return nil, err
 	}
+
+	eg := errgroup.Group{}
 	for _, key := range keys {
-		var bs []byte
-		if val, ok := results[key]; ok {
-			bs, err = c.Marshaler.Marshal(val)
-			if err != nil {
-				return nil, err
+		key := key
+		eg.Go(func() error {
+			var bs []byte
+			if val, ok := results[key]; ok {
+				bs, err = c.Marshaler.Marshal(val)
+				if err != nil {
+					return err
+				}
 			}
-		}
-		// 禁止缓存空值
-		if bs == nil && !c.disableStoreEmptyValue(ctx) {
-			bs = emptyCacheBsValue
-		}
-		if bs != nil {
-			if err = c.Storer.Set(ctx, c.getCacheKey(key), bs, c.Expiration); err != nil {
-				return nil, err
+			// 禁止缓存空值
+			if bs == nil && !c.disableStoreEmptyValue(ctx) {
+				bs = emptyCacheBsValue
 			}
-		}
+			if bs != nil {
+				if err = c.Storer.Set(ctx, c.getCacheKey(key), bs, c.Expiration); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+	}
+	if err = eg.Wait(); err != nil {
+		return nil, err
 	}
 
 	return results, nil
